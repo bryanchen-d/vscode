@@ -13,7 +13,7 @@ import { getSelectedModelIdentifier } from '../common/chatSelectedModel.js';
 import { ChatAgentLocation, ChatConfiguration } from '../common/constants.js';
 import { ConfigurationTarget, IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { Disposable, MutableDisposable } from '../../../../base/common/lifecycle.js';
-import { ICommandService } from '../../../../platform/commands/common/commands.js';
+import { CommandsRegistry, ICommandService } from '../../../../platform/commands/common/commands.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { localize } from '../../../../nls.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
@@ -767,7 +767,30 @@ export class ChatTipService extends Disposable implements IChatTipService {
 			this._logService.debug('#ChatTips: tip excluded because thinking phrases setting was previously modified', tip.id);
 			return false;
 		}
+		if (!this._areTipCommandsRegistered(tip)) {
+			return false;
+		}
 		this._logService.debug('#ChatTips: tip is eligible', tip.id);
+		return true;
+	}
+
+	/**
+	 * A tip may render `command:` links. If any referenced command is not
+	 * registered in the current build, clicking the link throws a
+	 * "command '...' not found" error that surfaces in error telemetry. Treat
+	 * such a tip as ineligible so it is never shown, rather than presenting a
+	 * dead link. This guards against stale command references in the tip
+	 * catalog (e.g. a command that only exists on an unmerged branch).
+	 */
+	private _areTipCommandsRegistered(tip: ITipDefinition): boolean {
+		const ctx: ITipBuildContext = { keybindingService: this._keybindingService, experimentalTipMessages: this._experimentalTipMessages };
+		const commandIds = extractCommandIds(tip.buildMessage(ctx).value);
+		for (const commandId of commandIds) {
+			if (!CommandsRegistry.getCommand(commandId)) {
+				this._logService.debug('#ChatTips: tip excluded because command is not registered', tip.id, commandId);
+				return false;
+			}
+		}
 		return true;
 	}
 
