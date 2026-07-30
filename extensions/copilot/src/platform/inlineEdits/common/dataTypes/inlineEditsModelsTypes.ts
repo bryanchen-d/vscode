@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { IValidator, vArray, vObj, vString } from '../../../configuration/common/validator';
+import { IValidator, vArray, vObj, vRequired, vString } from '../../../configuration/common/validator';
 
 export namespace WireTypes {
 
@@ -47,7 +47,7 @@ export namespace WireTypes {
 			models: Model.t[];
 		};
 		export const validator: IValidator<t> = vObj({
-			models: vArray(Model.validator),
+			models: vRequired(vArray(Model.validator)),
 		});
 		export function is(obj: unknown): obj is t {
 			return !!obj && typeof obj === 'object' && Array.isArray((obj as t).models) && (obj as t).models.every(Model.is);
