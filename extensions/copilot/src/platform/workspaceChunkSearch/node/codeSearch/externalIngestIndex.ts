@@ -605,6 +605,10 @@ export class ExternalIngestIndex extends Disposable {
 					enableForeignKeyConstraints: true,
 				});
 
+				// Wait for transient locks instead of immediately failing with
+				// "database is locked" when the same workspace is open in another window.
+				this.configureBusyTimeout(db);
+
 				const storedVersion = this.getStoredCacheVersion(db);
 				if (storedVersion === ingestUtils.cacheVersion()) {
 					this._logService.trace(`ExternalIngestIndex: Cache version matches (${ingestUtils.cacheVersion()})`);
@@ -627,6 +631,17 @@ export class ExternalIngestIndex extends Disposable {
 		}
 
 		return this.createFreshDatabase(dbPath);
+	}
+
+	/**
+	 * Ensures the connection waits for transient locks instead of immediately
+	 * throwing `SQLITE_BUSY` ("database is locked"). The per-workspace database
+	 * file can be opened concurrently by another window, so a short busy timeout
+	 * lets brief write overlaps resolve rather than surfacing as unhandled errors
+	 * from event-driven reads such as {@link get}.
+	 */
+	private configureBusyTimeout(db: sql.DatabaseSync): void {
+		db.exec(`PRAGMA busy_timeout = 5000;`);
 	}
 
 	private getStoredCacheVersion(db: sql.DatabaseSync): number | undefined {
@@ -657,6 +672,7 @@ export class ExternalIngestIndex extends Disposable {
 			PRAGMA locking_mode = EXCLUSIVE;
 			PRAGMA temp_store = MEMORY;
 		`);
+		this.configureBusyTimeout(db);
 
 		db.exec(`
 			CREATE TABLE IF NOT EXISTS Metadata (
