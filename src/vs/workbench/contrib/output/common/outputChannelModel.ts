@@ -22,7 +22,7 @@ import { VSBuffer } from '../../../../base/common/buffer.js';
 import { ILogger, ILoggerService, ILogService, LogLevel } from '../../../../platform/log/common/log.js';
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { ILogEntry, IOutputContentSource, LOG_MIME, OutputChannelUpdateMode } from '../../../services/output/common/output.js';
-import { isCancellationError } from '../../../../base/common/errors.js';
+import { CancellationError, isCancellationError } from '../../../../base/common/errors.js';
 import { TextModel } from '../../../../editor/common/model/textModel.js';
 import { binarySearch, sortedDiff } from '../../../../base/common/arrays.js';
 
@@ -492,16 +492,21 @@ export abstract class AbstractFileOutputChannelModel extends Disposable implemen
 	async loadModel(): Promise<ITextModel> {
 		this.loadModelPromise = Promises.withAsyncBody<ITextModel>(async (c, e) => {
 			try {
-				this.modelDisposable.value = new DisposableStore();
+				const modelDisposable = this.modelDisposable.value = new DisposableStore();
 				this.model = this.modelService.createModel('', this.language, this.modelUri);
 				const { content, consume } = await this.outputContentProvider.getContent();
+				if (modelDisposable.isDisposed) {
+					// This model was disposed while awaiting the content (e.g. the
+					// channel was closed). Abort so we don't operate on a disposed store.
+					throw new CancellationError();
+				}
 				consume();
 				this.doAppendContent(this.model, content);
-				this.modelDisposable.value.add(this.outputContentProvider.onDidReset(() => this.onDidContentChange(true, true)));
-				this.modelDisposable.value.add(this.outputContentProvider.onDidAppend(() => this.onDidContentChange(false, false)));
+				modelDisposable.add(this.outputContentProvider.onDidReset(() => this.onDidContentChange(true, true)));
+				modelDisposable.add(this.outputContentProvider.onDidAppend(() => this.onDidContentChange(false, false)));
 				this.outputContentProvider.watch();
-				this.modelDisposable.value.add(toDisposable(() => this.outputContentProvider.unwatch()));
-				this.modelDisposable.value.add(this.model.onWillDispose(() => {
+				modelDisposable.add(toDisposable(() => this.outputContentProvider.unwatch()));
+				modelDisposable.add(this.model.onWillDispose(() => {
 					this.outputContentProvider.reset();
 					this.modelDisposable.value = undefined;
 					this.cancelModelUpdate();
