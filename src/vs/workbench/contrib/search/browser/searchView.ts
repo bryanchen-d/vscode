@@ -2286,7 +2286,7 @@ export class SearchView extends ViewPane {
 						const matches = elemParent.matches();
 						const match = matchIndex >= matches.length ? matches[matches.length - 1] : matches[matchIndex];
 
-						if (isIMatchInNotebook(match)) {
+						if (isIMatchInNotebook(match) && this.tree.hasNode(match)) {
 							elemParent.showMatch(match);
 							if (!this.tree.getFocus().includes(match) || !this.tree.getSelection().includes(match)) {
 								this.tree.setSelection([match], getSelectionKeyboardEvent());
