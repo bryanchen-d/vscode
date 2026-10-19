@@ -35,10 +35,14 @@ export function applyEvidenceStartTool(server: McpServer, evidenceService: Evide
 			scenarioPath: z.string().optional().describe('Path to the Markdown scenario definition'),
 			workspacePath: z.string().optional().describe('Workspace or folder to open'),
 			userSettings: z.record(z.string(), jsonValueSchema).optional().describe('User settings to seed before VS Code starts'),
-			extraArgs: z.array(z.string()).optional().describe('Additional VS Code command-line arguments')
+			extraArgs: z.array(z.string()).optional().describe('Additional VS Code command-line arguments'),
+			subtitle: z.string().optional().describe('Shown after the title in the evidence video, for example the builds it applies to'),
+			purpose: z.enum(['verify', 'reproduce']).optional().describe('Whether a passing run verifies a fix (default) or reproduces a bug'),
+			setup: z.string().optional().describe('What has to be in place before the first step, shown on the SET UP band'),
+			notCovered: z.array(z.string()).optional().describe('Cases deliberately not exercised, listed on the verdict card')
 		},
-		async ({ scenarioId, title, source, scenarioPath, workspacePath, userSettings, extraArgs }) => {
-			const runPath = await evidenceService.start(scenarioId, title, source, scenarioPath, workspacePath, userSettings, extraArgs);
+		async ({ scenarioId, title, source, scenarioPath, workspacePath, userSettings, extraArgs, subtitle, purpose, setup, notCovered }) => {
+			const runPath = await evidenceService.start(scenarioId, title, source, scenarioPath, workspacePath, userSettings, extraArgs, undefined, { subtitle, purpose, setup, notCovered });
 			return {
 				content: [{ type: 'text' as const, text: `Evidence capture started: ${runPath}` }]
 			};
@@ -53,17 +57,35 @@ export function applyEvidenceTools(server: McpServer, evidenceService: EvidenceS
 			'Mark a scenario step in the video and save a screenshot of the current VS Code window',
 			{
 				id: z.string().describe('Stable step identifier from the scenario'),
-				title: z.string().describe('Human-readable step title'),
+				title: z.string().describe('Human-readable step title, written as an instruction'),
 				status: z.enum(['started', 'passed', 'failed', 'skipped']).describe('Step lifecycle status'),
-				details: z.string().optional().describe('Validation result or failure details')
+				details: z.string().optional().describe('Validation result or failure details'),
+				ref: z.string().optional().describe('Issue or item the step checks, for example #315712'),
+				lookFor: z.string().optional().describe('What a person should see when the step passes')
 			},
-			async ({ id, title, status, details }) => {
-				const result = await evidenceService.step(id, title, status, details);
+			async ({ id, title, status, details, ref, lookFor }) => {
+				const result = await evidenceService.step(id, title, status, details, undefined, { ref, lookFor });
 				return {
 					content: [
 						{ type: 'text' as const, text: `Evidence saved: ${result.screenshotPath}` },
 						{ type: 'image' as const, data: result.screenshot.toString('base64'), mimeType: 'image/png' }
 					]
+				};
+			}
+		),
+		server.tool(
+			'vscode_automation_evidence_note',
+			'Record a note on the active step: "changed" pauses the video on a difference between the test instructions and the product; "finding" lists something worth a look that is not part of pass/fail',
+			{
+				kind: z.enum(['changed', 'finding']).describe('changed: instructions differ from the product; finding: worth a look, not pass/fail'),
+				title: z.string().describe('One-line note'),
+				body: z.string().optional().describe('Explanation'),
+				caption: z.string().optional().describe('Caption for the attached screenshot')
+			},
+			async ({ kind, title, body, caption }) => {
+				await evidenceService.annotate(kind, { title, body, caption });
+				return {
+					content: [{ type: 'text' as const, text: `Evidence note recorded: ${title}` }]
 				};
 			}
 		),

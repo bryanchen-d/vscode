@@ -7,6 +7,7 @@ import type { Page } from '@playwright/test';
 import * as fs from 'fs';
 import * as path from 'path';
 import { ApplicationService, getProductVersion, JSONValue } from './application';
+import { InteractionRecorder } from './interactions';
 
 const rootPath = path.join(__dirname, '..', '..', '..');
 const artifactRootPath = path.join(rootPath, '.build', 'vscode-playwright-mcp');
@@ -38,7 +39,57 @@ interface EvidenceCapture {
 interface EvidenceStep {
 	id: string;
 	title: string;
+	ref?: string;
+	lookFor?: string;
 	captures: EvidenceCapture[];
+}
+
+/** How the evidence video introduces the run and each step. */
+export interface EvidencePresentation {
+	/** Shown after the title in every header, for example the build range it applies to. */
+	subtitle?: string;
+	/** `verify` (default) reports a passing run as VERIFIED; `reproduce` reports it as REPRODUCED. */
+	purpose?: 'verify' | 'reproduce';
+	/** What has to be in place before the first step, shown on the SET UP band. */
+	setup?: string;
+	/** Cases deliberately not exercised, listed on the verdict card. */
+	notCovered?: string[];
+	steps?: { id: string; ref?: string; lookFor?: string }[];
+}
+
+export interface EvidenceBox {
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+}
+
+/**
+ * A note recorded during a step.
+ *
+ * `changed` marks a difference between the test instructions and the product
+ * (for example a renamed control); the video pauses on it. `finding` is worth a
+ * look but is not part of pass/fail; it is listed after the verdict.
+ */
+export interface EvidenceAnnotationInput {
+	title: string;
+	body?: string;
+	caption?: string;
+	/** Area of the current window to outline, in CSS pixels. */
+	highlight?: EvidenceBox;
+	image?: { path?: string; data?: Buffer };
+}
+
+interface EvidenceAnnotation {
+	kind: 'changed' | 'finding';
+	stepId?: string;
+	timestamp: string;
+	title: string;
+	body?: string;
+	caption?: string;
+	highlight?: EvidenceBox;
+	viewport?: { width: number; height: number; dpr?: number };
+	image?: string;
 }
 
 interface LogFileSnapshot {
@@ -78,6 +129,10 @@ interface EvidenceRun {
 		quality: string;
 		commit?: string;
 	};
+	presentation: Omit<EvidencePresentation, 'steps'> & { userSettings?: Record<string, JSONValue> };
+	stepPresentation: Map<string, { ref?: string; lookFor?: string }>;
+	interactions: InteractionRecorder;
+	annotations: EvidenceAnnotation[];
 	steps: EvidenceStep[];
 }
 
@@ -86,7 +141,7 @@ export class EvidenceService {
 
 	constructor(private readonly appService: ApplicationService) { }
 
-	async start(scenarioId: string, title: string, source?: string, scenarioPath?: string, workspacePath?: string, userSettings?: Record<string, JSONValue>, extraArgs?: string[], extraEnv?: Readonly<Record<string, string | undefined>>): Promise<string> {
+	async start(scenarioId: string, title: string, source?: string, scenarioPath?: string, workspacePath?: string, userSettings?: Record<string, JSONValue>, extraArgs?: string[], extraEnv?: Readonly<Record<string, string | undefined>>, presentation?: EvidencePresentation): Promise<string> {
 		if (this.currentRun) {
 			throw new Error(`Evidence run '${this.currentRun.id}' is already active.`);
 		}
@@ -131,6 +186,16 @@ export class EvidenceService {
 				quality: 'unknown',
 				commit: process.env.GITHUB_SHA ?? process.env.BUILD_SOURCEVERSION
 			},
+			presentation: {
+				subtitle: presentation?.subtitle,
+				purpose: presentation?.purpose,
+				setup: presentation?.setup,
+				notCovered: presentation?.notCovered?.length ? [...presentation.notCovered] : undefined,
+				userSettings
+			},
+			stepPresentation: new Map((presentation?.steps ?? []).map(step => [step.id, { ref: step.ref, lookFor: step.lookFor }])),
+			interactions: new InteractionRecorder(),
+			annotations: [],
 			steps: []
 		};
 		this.currentRun = run;
@@ -155,6 +220,7 @@ export class EvidenceService {
 				if (video) {
 					run.videos.add(video);
 				}
+				run.interactions.track(page);
 			};
 			for (const page of app.code.driver.getAllWindows()) {
 				run.pageListener(page);
@@ -190,12 +256,22 @@ export class EvidenceService {
 		}
 	}
 
-	async step(id: string, title: string, status: StepStatus, details?: string, blockedOn?: StepBlocker): Promise<{ screenshot: Buffer; screenshotPath: string }> {
+	async step(id: string, title: string, status: StepStatus, details?: string, blockedOn?: StepBlocker, presentation?: { ref?: string; lookFor?: string }): Promise<{ screenshot: Buffer; screenshotPath: string }> {
 		const run = this.requireRun();
 		if (run.state !== 'active') {
 			throw new Error(`Evidence run '${run.id}' is busy (${run.state}).`);
 		}
 		let step = run.steps.find(candidate => candidate.id === id);
+		const createStep = (): EvidenceStep => {
+			const described = { ...run.stepPresentation.get(id), ...presentation };
+			return {
+				id,
+				title,
+				...(described.ref ? { ref: described.ref } : {}),
+				...(described.lookFor ? { lookFor: described.lookFor } : {}),
+				captures: []
+			};
+		};
 
 		let isNewStep = false;
 		if (status === 'started') {
@@ -206,7 +282,7 @@ export class EvidenceService {
 			if (activeStep) {
 				throw new Error(`Step '${activeStep.id}' is still active. Mark it passed or failed before starting '${id}'.`);
 			}
-			step = { id, title, captures: [] };
+			step = createStep();
 			run.steps.push(step);
 			isNewStep = true;
 		} else if (!step && status === 'skipped') {
@@ -214,7 +290,7 @@ export class EvidenceService {
 			if (activeStep) {
 				throw new Error(`Step '${activeStep.id}' is still active. Complete it before skipping '${id}'.`);
 			}
-			step = { id, title, captures: [] };
+			step = createStep();
 			run.steps.push(step);
 			isNewStep = true;
 		} else if (!step || step.captures.at(-1)?.status !== 'started') {
@@ -229,6 +305,7 @@ export class EvidenceService {
 				throw new Error('VS Code is not running. Finish the evidence run as aborted or failed.');
 			}
 			run.pageListener?.(app.code.driver.currentPage);
+			await run.interactions.drain();
 			let screenshot: Buffer | undefined;
 			for (let attempt = 0; attempt < 2; attempt++) {
 				try {
@@ -304,6 +381,7 @@ export class EvidenceService {
 				}
 			};
 			if (app) {
+				await run.interactions.drain();
 				for (let attempt = 0; attempt < 2; attempt++) {
 					try {
 						await wait(500);
@@ -385,6 +463,56 @@ export class EvidenceService {
 		}
 	}
 
+	/**
+	 * Record a note against the step in progress.
+	 *
+	 * The note is only described here; the evidence video renders it afterwards,
+	 * so nothing is drawn into the product while it is recorded.
+	 */
+	async annotate(kind: 'changed' | 'finding', note: EvidenceAnnotationInput): Promise<void> {
+		const run = this.requireRun();
+		if (run.state !== 'active') {
+			throw new Error(`Evidence run '${run.id}' is busy (${run.state}).`);
+		}
+		if (typeof note?.title !== 'string' || !note.title.trim()) {
+			throw new Error('An evidence note requires a title.');
+		}
+		const activeStep = run.steps.find(candidate => candidate.captures.at(-1)?.status === 'started');
+		const annotation: EvidenceAnnotation = {
+			kind,
+			stepId: activeStep?.id,
+			timestamp: new Date().toISOString(),
+			title: note.title.trim(),
+			...(note.body ? { body: note.body } : {}),
+			...(note.caption ? { caption: note.caption } : {})
+		};
+		const app = this.appService.application;
+		if (note.highlight) {
+			annotation.highlight = { x: note.highlight.x, y: note.highlight.y, width: note.highlight.width, height: note.highlight.height };
+			if (app) {
+				try {
+					annotation.viewport = await app.code.driver.currentPage.evaluate('({ width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio || 1 })') as { width: number; height: number; dpr: number };
+				} catch {
+					// Without the viewport the outline cannot be placed; the note is still shown.
+					delete annotation.highlight;
+				}
+			}
+		}
+		if (note.image) {
+			const extension = note.image.path ? path.extname(note.image.path).toLowerCase() : '.png';
+			if (!['.png', '.jpg', '.jpeg', '.gif', '.webp'].includes(extension)) {
+				throw new Error(`Evidence note images must be PNG, JPEG, GIF or WebP: '${note.image.path}'.`);
+			}
+			const data = note.image.data ?? fs.readFileSync(path.resolve(note.image.path!));
+			const relativePath = `annotations/${String(run.annotations.length + 1).padStart(2, '0')}-${kind}${extension}`;
+			fs.mkdirSync(path.join(run.runPath, 'annotations'), { recursive: true });
+			fs.writeFileSync(path.join(run.runPath, relativePath), data);
+			annotation.image = relativePath;
+		}
+		run.annotations.push(annotation);
+		this.writeManifest();
+	}
+
 	private requireRun(): EvidenceRun {
 		if (!this.currentRun) {
 			throw new Error('No evidence run is active. Start one before recording steps.');
@@ -453,8 +581,11 @@ export class EvidenceService {
 			outcome: run.outcome,
 			notes: run.notes,
 			environment: run.environment,
+			presentation: run.presentation,
 			artifacts: run.artifacts,
-			steps: run.steps
+			steps: run.steps,
+			annotations: run.annotations,
+			interactions: run.interactions.snapshot()
 		};
 		fs.writeFileSync(path.join(run.runPath, 'manifest.json'), JSON.stringify(manifest, undefined, 2));
 	}
@@ -465,7 +596,8 @@ export class EvidenceService {
 			const result = step.captures.at(-1);
 			const screenshots = step.captures.map(capture => `<a href="${escapeHtml(capture.screenshot)}">${escapeHtml(capture.status)}</a>`).join(', ');
 			const blocker = result?.blockedOn ? ` <span class="blocked">(needs ${escapeHtml(result.blockedOn)})</span>` : '';
-			return `<tr><td>${escapeHtml(step.id)}</td><td>${escapeHtml(step.title)}</td><td class="${escapeHtml(result?.status ?? '')}">${escapeHtml(result?.status ?? 'unknown')}${blocker}</td><td>${screenshots}</td><td>${escapeHtml(result?.details ?? '')}</td></tr>`;
+			const lookFor = step.lookFor ? `<br><small>Look for: ${escapeHtml(step.lookFor)}</small>` : '';
+			return `<tr><td>${escapeHtml(step.ref ? `${step.ref} ${step.id}` : step.id)}</td><td>${escapeHtml(step.title)}${lookFor}</td><td class="${escapeHtml(result?.status ?? '')}">${escapeHtml(result?.status ?? 'unknown')}${blocker}</td><td>${screenshots}</td><td>${escapeHtml(result?.details ?? '')}</td></tr>`;
 		}).join('');
 		const blocked = run.steps
 			.map(step => ({ step, capture: step.captures.at(-1) }))
@@ -474,6 +606,13 @@ export class EvidenceService {
 			? `<h2>Needs attention</h2><ul>${blocked.map(({ step, capture }) =>
 				`<li><strong>${escapeHtml(step.id)}</strong> needs ${escapeHtml(capture.blockedOn ?? '')}: ${escapeHtml(capture.details ?? '')}</li>`).join('')}</ul>`
 			: '';
+		const noteSection = (kind: EvidenceAnnotation['kind'], heading: string) => {
+			const notes = run.annotations.filter(annotation => annotation.kind === kind);
+			return notes.length
+				? `<h2>${heading}</h2><ul>${notes.map(note => `<li><strong>${escapeHtml(note.title)}</strong>${note.stepId ? ` (step ${escapeHtml(note.stepId)})` : ''}${note.body ? `: ${escapeHtml(note.body)}` : ''}${note.image ? ` <a href="${escapeHtml(note.image)}">image</a>` : ''}${note.caption ? ` <small>${escapeHtml(note.caption)}</small>` : ''}</li>`).join('')}</ul>`
+				: '';
+		};
+		const notesSection = noteSection('changed', 'Changed from the test') + noteSection('finding', 'Worth a look (not part of pass/fail)');
 		const videoElements = run.artifacts.videos.length
 			? run.artifacts.videos.map(video => `<video controls src="${escapeHtml(video)}"></video>`).join('')
 			: '<p>No video file was produced.</p>';
@@ -484,7 +623,7 @@ export class EvidenceService {
 <body><h1>${escapeHtml(run.title)}</h1><p><strong>Scenario:</strong> ${escapeHtml(run.scenarioId)}<br><strong>Outcome:</strong> <span class="${escapeHtml(run.outcome ?? '')}">${escapeHtml(run.outcome ?? 'unknown')}</span><br><strong>Started:</strong> ${escapeHtml(run.startedAt)}<br><strong>Completed:</strong> ${escapeHtml(run.completedAt ?? '')}</p>
 <p><strong>Source:</strong> ${run.source ? `<a href="${escapeHtml(run.source)}">${escapeHtml(run.source)}</a>` : 'Not recorded'}<br><strong>Workspace:</strong> ${escapeHtml(run.workspacePath ?? 'Not specified')}<br><strong>Environment:</strong> ${escapeHtml(`${run.environment.platform} ${run.environment.architecture}; VS Code ${run.environment.vscodeVersion} (${run.environment.quality}); Node ${run.environment.nodeVersion}; commit ${run.environment.commit ?? 'unknown'}`)}</p>
 <p>${escapeHtml(run.notes ?? '')}</p><h2>Steps</h2><table><thead><tr><th>ID</th><th>Title</th><th>Result</th><th>Screenshots</th><th>Details</th></tr></thead><tbody>${rows}</tbody></table>
-${blockedSection}<h2>Video</h2>${videoElements}<h2>Trace and logs</h2>${logs ? `<ul>${logs}</ul>` : '<p>No new trace or log content was produced.</p>'}</body></html>`;
+${blockedSection}${notesSection}<h2>Video</h2>${videoElements}<h2>Trace and logs</h2>${logs ? `<ul>${logs}</ul>` : '<p>No new trace or log content was produced.</p>'}</body></html>`;
 		const reportPath = path.join(run.runPath, 'report.html');
 		fs.writeFileSync(reportPath, html);
 		return reportPath;

@@ -1,6 +1,6 @@
 ---
 name: validate-ui-scenario
-description: Use when reproducing a UI bug or verifying a fix by driving a real VS Code window end to end and capturing evidence. Writes a scenario file, runs it against a dev build or installed Insiders, and produces a captioned video, per-step screenshots, a Playwright trace, and an HTML report to attach to an issue or pull request.
+description: Use when reproducing a UI bug or verifying a fix by driving a real VS Code window end to end and capturing evidence. Writes a scenario file, runs it against a dev build or installed Insiders, and produces a reviewer video (verdict card, per-step DO/LOOK FOR band, zoomed inset, cursor and shortcuts, paused notes), per-step screenshots, a Playwright trace, and an HTML report to attach to an issue or pull request.
 ---
 
 # Validate UI Scenario
@@ -27,6 +27,17 @@ npm --prefix test/scenario run compile  # after any change under test/scenario
 | Linux | `sudo apt install ffmpeg` |
 
 A new terminal may be needed for `PATH` to pick them up, or set `FFMPEG_PATH` and `FFPROBE_PATH`. An existing run can be annotated afterwards with `node test/scenario/out/renderEvidenceChapters.js <run-dir>`.
+
+The full reviewer video also needs a headless Chromium to draw its cards and bands: Playwright's bundled browser (`npx playwright install chromium`), else installed Chrome or Edge. Without one the renderer falls back to a plain caption band and records why in `manifest.json` (`rendering.fallbackReason`).
+
+| Variable | Effect |
+|----------|--------|
+| `EVIDENCE_NARRATION` | `azure` (Azure Speech HD voice), `system` (offline OS voice), `none`. Unset: Azure when its credentials are present, else silent |
+| `AZURE_SPEECH_REGION` or `AZURE_SPEECH_ENDPOINT`, plus `AZURE_SPEECH_KEY` or `AZURE_SPEECH_TOKEN` | Azure Speech credentials |
+| `EVIDENCE_NARRATION_VOICE` | Voice name; Azure defaults to `en-US-Andrew:DragonHDLatestNeural` |
+| `EVIDENCE_VIDEO_STYLE=caption-band` | Force the plain caption band |
+
+Narration is generated from the manifest, so it only states what the evidence shows. Use only an Azure resource the user has approved; a failed requested provider is reported, never replaced.
 
 | Target | Flags | Also required | Use for |
 |--------|-------|---------------|---------|
@@ -88,6 +99,7 @@ module.exports = {
 		{
 			id: 'SS-01',
 			title: 'Open the Settings editor',
+			lookFor: 'The Settings editor opens.',
 			async run(context) {
 				await context.workbench.quickaccess.runCommand('workbench.action.openSettings2');
 				await context.page.waitForSelector('.settings-editor', { state: 'visible', timeout: 20000 });
@@ -96,7 +108,9 @@ module.exports = {
 		},
 		{
 			id: 'SS-02',
-			title: 'Search across title and description',
+			ref: '#250159',
+			title: 'Search `chat confirm`',
+			lookFor: 'Max Requests is in the results; its description mentions confirmation.',
 			async run(context) {
 				await context.workbench.settingsEditor.searchSettingsUI('chat confirm');
 				const titles = await context.page.evaluate(COLLECT_TITLES);
@@ -112,7 +126,11 @@ module.exports = {
 
 | Field | Meaning |
 |-------|---------|
-| `id`, `title` | Identify the run; `id` names the evidence directory |
+| `id`, `title` | Identify the run; `id` names the evidence directory, `title` heads every card and band |
+| `subtitle` | Shown after the title, for example `Insiders from Oct 14 or newer` |
+| `purpose` | `verify` (default) labels a pass VERIFIED; `reproduce` labels it REPRODUCED |
+| `setup` | What must be in place before step 1; shown on the SET UP band with `userSettings` |
+| `notCovered` | Cases deliberately not exercised; listed on the verdict card with skipped steps |
 | `source` | Issue or test-plan item the scenario came from |
 | `workspacePath` | Disposable folder to open |
 | `userSettings` | Settings seeded into the profile before launch, including the built-in Agents profile when using `--agents` |
@@ -120,13 +138,22 @@ module.exports = {
 | `extraEnv` | Environment overrides for the launched app; `undefined` unsets a variable. Keep the automation runner's HOME unchanged and isolate application discovery with this field. |
 | `stepPauseMs` | How long to hold each finished step so its caption is readable. Defaults to `1000`; set `0` when the scenario is timing-sensitive |
 
-Each step receives a `context` with `app`, `workbench`, `code`, `page`, and `skip(reason, options)`. `workbench` exposes the feature helpers (`settingsEditor`, `quickaccess`, `editors`, `terminal`, `chat`, …); `page` is the Playwright page for anything they do not cover.
+| Step field | Meaning |
+|------------|---------|
+| `id` | Stable identifier for screenshots and chapters |
+| `title` | The instruction a person would follow, shown as **DO**; `` `code` `` renders as a chip, `->` as an arrow |
+| `lookFor` | What a person should see when the step passes, shown as **LOOK FOR** |
+| `ref` | Issue the step checks, for example `#315712`; heads the step band |
+
+Each step receives a `context` with `app`, `workbench`, `code`, `page`, `skip(reason, options)`, `changed(note)` and `finding(note)`. `workbench` exposes the feature helpers (`settingsEditor`, `quickaccess`, `editors`, `terminal`, `chat`, …); `page` is the Playwright page for anything they do not cover.
 
 Use `context.code.driver.resizeWindow({ width, height })` for responsive-layout scenarios. It resizes the current native Electron window (or the browser viewport on web) and returns the previous size for restoration.
 
-- **Return a string** describing how the step was validated. It appears in the report.
+- **Return a string** describing how the step was validated. It appears in the report and as the step's RESULT.
 - **Throw** to fail the step. The message is recorded, and the run stops.
 - **Call `skip(reason, { needs })`** when the step cannot be validated automatically. The run stops and is reported as `aborted`, never as passed.
+- **Call `await changed({ title, body, highlight, image, imageCaption })`** when the product differs from the instructions (a renamed control, a moved menu). The video pauses on a CHANGED FROM THE TEST card, outlines `highlight` (selector or locator), shows `image` (a file path, such as the issue's screenshot), and lists it under TO REPORT.
+- **Call `await finding({ title, body, element, caption })`** for something worth a look that is not part of pass/fail. It is shown after the verdict with a screenshot of `element`, or of the window.
 
 ## Steps that cannot be automated
 
@@ -142,7 +169,7 @@ ctx.skip('Comparing physical print output requires a person with a printer.', { 
 ctx.skip('The harness cannot drive native OS file dialogs.', { needs: 'infrastructure' });
 ```
 
-Blocked steps are recorded in `manifest.json`, highlighted in a **Needs attention** section of `report.html`, marked on the video caption (`SKIPPED - NEEDS HUMAN`), and printed at the end of the run. Surface them in your summary — never quietly drop a step you could not perform, and never weaken an assertion so that it passes.
+Blocked steps are recorded in `manifest.json`, highlighted in a **Needs attention** section of `report.html`, marked on the step band (`SKIPPED · NEEDS A PERSON`), listed under NOT COVERED and TO REPORT, and printed at the end of the run. Surface them in your summary — never quietly drop a step you could not perform, and never weaken an assertion so that it passes.
 
 ## Run it
 
@@ -156,14 +183,26 @@ Evidence is written to `.build/vscode-playwright-mcp/evidence/<run-id>/`:
 
 | File | Contents |
 |------|----------|
-| `report.html` | Step table, outcome, embedded video |
-| `manifest.json` | Step timestamps, statuses, artifact paths, environment |
-| `videos/annotated.mp4` | Recording with a caption band showing each step and its validation result |
+| `report.html` | Step table, outcome, notes, embedded video |
+| `manifest.json` | Step timestamps, statuses, notes, pointer and shortcut events, artifact paths, environment, `rendering` (style, narration, chapters) |
+| `videos/annotated.mp4` | The reviewer video described below |
 | `videos/*.webm` | The raw recording |
-| `*.png` | Per-step screenshots |
+| `*.png`, `annotations/` | Per-step screenshots and note images |
 | `logs/` | Playwright trace, window and server logs |
 
-The caption band is added **above** the recorded frame rather than drawn over it, so no recorded pixel is hidden and the recording keeps its original length. Each caption carries the step number and id, its status, the step title, and the validation detail the step reported. Re-render after editing a manifest with `node test/scenario/out/renderEvidenceChapters.js <run-dir>`.
+The reviewer video, in order:
+
+| Part | Shows |
+|------|-------|
+| VERDICT card | Computed VERIFIED / NOT VERIFIED / INCOMPLETE pill, headline, build, NOT COVERED |
+| SET UP band | `setup` and `userSettings` chips over the footage before step 1 |
+| Step bands | `ref · N OF M`, DO, LOOK FOR, then the PASSED/FAILED pill and RESULT when the step closes; a zoomed inset follows the pointer |
+| Footage | Unmodified recording with a composited cursor and shortcut chips (`⌥⇧⌘L`, `Esc`); never typed text |
+| Paused notes | `changed()` freezes the frame with an outlined control and the note card |
+| TO REPORT | Timestamped changes, failures and blocked steps |
+| WORTH A LOOK | One card per `finding()` |
+
+Bands sit **above** the recorded frame, so no recorded pixel is hidden, and every source frame is kept in order; cards and holds only add time. Re-render after editing a manifest with `node test/scenario/out/renderEvidenceChapters.js <run-dir>`.
 
 ## What makes evidence trustworthy
 
@@ -181,7 +220,7 @@ Always call out, separately from the pass/fail result:
 
 - **steps that need a person**, so someone knows what is still unverified;
 - **steps blocked on a missing harness capability**, named as a concrete enhancement to this skill;
-- **anything that degraded the evidence**, such as a missing ffmpeg leaving the video uncaptioned.
+- **anything that degraded the evidence**, such as a missing ffmpeg leaving the video uncaptioned, a caption-band fallback (`rendering.fallbackReason`), or failed narration (`rendering.narration`).
 
 ## Related
 

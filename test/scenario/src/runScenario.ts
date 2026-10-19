@@ -3,11 +3,11 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import type { Page } from '@playwright/test';
+import type { Locator, Page } from '@playwright/test';
 import * as path from 'path';
 import type { Application, Code, Workbench } from '../../automation';
 import { ApplicationService, JSONValue } from './application';
-import { EvidenceService, StepBlocker } from './evidence';
+import { EvidenceBox, EvidenceService, StepBlocker } from './evidence';
 import { resolveVideoTool, tryRenderChapters } from './renderEvidenceChapters';
 
 /**
@@ -70,12 +70,29 @@ export interface ScenarioContext {
 	 * request against this skill.
 	 */
 	skip(reason: string, options?: { needs?: StepBlocker }): never;
+	/**
+	 * Note a difference between the test instructions and the product, such as a
+	 * renamed control. The video pauses here on a CHANGED FROM THE TEST card,
+	 * outlining `highlight` and showing `image` (for example the screenshot from
+	 * the issue) with `imageCaption` beneath it. `image` is a file path.
+	 */
+	changed(note: { title: string; body?: string; highlight?: string | Locator; image?: string; imageCaption?: string }): Promise<void>;
+	/**
+	 * Note something worth a look that is not part of pass/fail. It is listed
+	 * after the verdict with a screenshot of `element`, or of the window.
+	 */
+	finding(note: { title: string; body?: string; element?: string | Locator; caption?: string }): Promise<void>;
 }
 
 export interface ScenarioStep {
 	/** Stable identifier, used for screenshot names and the chapter card. */
 	readonly id: string;
+	/** What to do, written as an instruction. Shown as DO. */
 	readonly title: string;
+	/** The issue or item this step checks, for example `#315712`. */
+	readonly ref?: string;
+	/** What a person should see when the step passes. Shown as LOOK FOR. */
+	readonly lookFor?: string;
 	/**
 	 * Performs the step. Throw to fail it; the thrown message becomes the
 	 * recorded detail. Return a string to describe how the step was validated.
@@ -86,6 +103,14 @@ export interface ScenarioStep {
 export interface Scenario {
 	readonly id: string;
 	readonly title: string;
+	/** Shown after the title in every header, for example `Insiders from Oct 14 or newer`. */
+	readonly subtitle?: string;
+	/** `verify` (default) reports a passing run as VERIFIED; `reproduce` reports it as REPRODUCED. */
+	readonly purpose?: 'verify' | 'reproduce';
+	/** What has to be in place before the first step. Shown on the SET UP band with `userSettings`. */
+	readonly setup?: string;
+	/** Cases this scenario deliberately does not exercise, listed on the verdict card. */
+	readonly notCovered?: readonly string[];
 	/** Issue or test-plan item this scenario was derived from. */
 	readonly source?: string;
 	/** Markdown definition this scenario implements. */
@@ -110,6 +135,19 @@ export interface Scenario {
 
 const DEFAULT_STEP_PAUSE_MS = 1000;
 
+function locatorOf(page: Page, target: string | Locator): Locator {
+	return typeof target === 'string' ? page.locator(target).first() : target;
+}
+
+async function boxOf(page: Page, target: string | Locator): Promise<EvidenceBox | undefined> {
+	try {
+		return (await locatorOf(page, target).boundingBox({ timeout: 5000 })) ?? undefined;
+	} catch {
+		// The note is still recorded; only its outline is lost.
+		return undefined;
+	}
+}
+
 class SkipStep extends Error {
 	constructor(reason: string, readonly needs?: StepBlocker) {
 		super(reason);
@@ -132,6 +170,17 @@ function loadScenario(scenarioPath: string): Scenario {
 	if (!Array.isArray(scenario.steps) || scenario.steps.length === 0) {
 		throw new Error(`Scenario '${scenarioPath}' must declare at least one step.`);
 	}
+	for (const field of ['subtitle', 'setup'] as const) {
+		if (scenario[field] !== undefined && typeof scenario[field] !== 'string') {
+			throw new Error(`Scenario '${scenarioPath}' declares a non-string '${field}'.`);
+		}
+	}
+	if (scenario.purpose !== undefined && scenario.purpose !== 'verify' && scenario.purpose !== 'reproduce') {
+		throw new Error(`Scenario '${scenarioPath}' purpose must be 'verify' or 'reproduce'.`);
+	}
+	if (scenario.notCovered !== undefined && (!Array.isArray(scenario.notCovered) || scenario.notCovered.some(item => typeof item !== 'string'))) {
+		throw new Error(`Scenario '${scenarioPath}' notCovered must be an array of strings.`);
+	}
 	const seen = new Set<string>();
 	for (const step of scenario.steps) {
 		if (typeof step?.id !== 'string' || !step.id || typeof step.title !== 'string' || !step.title) {
@@ -141,6 +190,11 @@ function loadScenario(scenarioPath: string): Scenario {
 			throw new Error(`Scenario '${scenarioPath}' repeats step id '${step.id}'.`);
 		}
 		seen.add(step.id);
+		for (const field of ['ref', 'lookFor'] as const) {
+			if (step[field] !== undefined && typeof step[field] !== 'string') {
+				throw new Error(`Step '${step.id}' declares a non-string '${field}'.`);
+			}
+		}
 		if (typeof step.run !== 'function') {
 			throw new Error(`Step '${step.id}' does not declare a 'run' function.`);
 		}
@@ -169,7 +223,14 @@ export async function runScenario(scenario: Scenario): Promise<{ runPath: string
 		scenario.workspacePath,
 		scenario.userSettings,
 		scenario.extraArgs,
-		scenario.extraEnv
+		scenario.extraEnv,
+		{
+			subtitle: scenario.subtitle,
+			purpose: scenario.purpose,
+			setup: scenario.setup,
+			notCovered: scenario.notCovered ? [...scenario.notCovered] : undefined,
+			steps: scenario.steps.map(step => ({ id: step.id, ref: step.ref, lookFor: step.lookFor }))
+		}
 	);
 	console.log(`Evidence run: ${runPath}`);
 
@@ -182,12 +243,39 @@ export async function runScenario(scenario: Scenario): Promise<{ runPath: string
 			if (!app) {
 				throw new Error('VS Code is no longer running.');
 			}
+			const page = app.code.driver.currentPage;
 			const context: ScenarioContext = {
 				app,
 				workbench: app.workbench,
 				code: app.code,
-				page: app.code.driver.currentPage,
-				skip: (reason: string, options?: { needs?: StepBlocker }) => { throw new SkipStep(reason, options?.needs); }
+				page,
+				skip: (reason: string, options?: { needs?: StepBlocker }) => { throw new SkipStep(reason, options?.needs); },
+				changed: async note => {
+					const highlight = note.highlight ? await boxOf(page, note.highlight) : undefined;
+					await evidence.annotate('changed', {
+						title: note.title,
+						body: note.body,
+						caption: note.imageCaption,
+						highlight,
+						image: note.image ? { path: note.image } : undefined
+					});
+				},
+				finding: async note => {
+					let data: Buffer | undefined;
+					try {
+						data = note.element
+							? await locatorOf(page, note.element).screenshot({ timeout: 5000 })
+							: await app.code.driver.screenshotBuffer(false);
+					} catch {
+						// A finding without its screenshot is still worth listing.
+					}
+					await evidence.annotate('finding', {
+						title: note.title,
+						body: note.body,
+						caption: note.caption,
+						image: data ? { data } : undefined
+					});
+				}
 			};
 			try {
 				const details = await step.run(context);
@@ -227,7 +315,7 @@ export async function runScenario(scenario: Scenario): Promise<{ runPath: string
 
 	const reportPath = await evidence.finish(outcome, notes);
 	console.log(`Report: ${reportPath}`);
-	tryRenderChapters(runPath);
+	await tryRenderChapters(runPath);
 	for (const blocker of blockers) {
 		const reason = blocker.reason.replace(/\s*\.\s*$/u, '');
 		console.log(blocker.needs === 'human'

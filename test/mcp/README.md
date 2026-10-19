@@ -101,14 +101,14 @@ The MCP server exposes a comprehensive set of VS Code automation tools through t
 
 Start evidence capture before starting VS Code so Playwright enables video recording:
 
-1. Call `vscode_automation_evidence_start`, including any required pre-launch `userSettings`.
-2. Call `vscode_automation_evidence_step` with `started` before each action.
-3. Perform and validate the action with the relevant automation tools.
+1. Call `vscode_automation_evidence_start`, including any required pre-launch `userSettings`. Optional `subtitle`, `purpose`, `setup` and `notCovered` describe the run on the video's verdict card and SET UP band.
+2. Call `vscode_automation_evidence_step` with `started` before each action. Write `title` as an instruction (shown as DO) and pass `lookFor` with what a person should see (shown as LOOK FOR), plus `ref` for the issue the step checks.
+3. Perform and validate the action with the relevant automation tools. Call `vscode_automation_evidence_note` with `changed` when the product differs from the instructions (the video pauses on it) or `finding` for something worth a look that is not part of pass/fail.
 4. Call `vscode_automation_evidence_step` with `passed`, `failed`, or `skipped`.
-5. Call `vscode_automation_evidence_finish`.
+5. Call `vscode_automation_evidence_finish`, then render the reviewer video with `node test/scenario/out/renderEvidenceChapters.js <run-dir>`.
 
 Artifacts are written to `.build/vscode-playwright-mcp/evidence/<run-id>/`.
-Each evidence run uses an isolated user profile with in-memory secret storage and records every visited Playwright page as a separate video.
+Each evidence run uses an isolated user profile with in-memory secret storage and records every visited Playwright page as a separate video. Pointer positions and shortcuts (never typed text) are recorded so the video can show the cursor and keystrokes.
 
 ## Development
 

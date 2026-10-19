@@ -3,22 +3,38 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-// Composes a caption band onto an evidence recording.
+// Renders the reviewer-facing evidence video from a recording.
 //
-// Step titles and their validation results are rendered onto the video *after*
-// the run instead of being drawn into the window while it is recorded, so the
-// capture shows unmodified product UI.
-//
-// The band is added above the recorded frame rather than drawn over it, so the
-// annotation costs no recorded pixels: the entire workbench stays legible, and
-// the recording keeps its original length.
+// Everything is added *after* the run instead of being drawn into the window
+// while it is recorded, so the capture shows unmodified product UI. The
+// storyboard style (see `evidenceVideo/`) opens on a verdict card, shows each
+// step's instruction and expectation in a band above the footage with a zoomed
+// inset, composites the pointer and shortcuts, pauses on notes, and closes with
+// what to report. Without a headless browser it falls back to a plain caption
+// band. Either way the band sits above the recorded frame, so no recorded pixel
+// is hidden and every source frame is kept.
 //
 // Usage: node out/renderEvidenceChapters.js <evidence-run-directory>
+// Set EVIDENCE_VIDEO_STYLE=caption-band to force the plain band, and see
+// `evidenceVideo/narration.ts` for EVIDENCE_NARRATION.
 
 import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+
+/**
+ * The storyboard renderer, loaded on demand. CI compiles this file on its own
+ * from a sparse checkout, so a missing `evidenceVideo/` folder must degrade to
+ * the caption band rather than break compilation.
+ */
+interface StoryboardRenderer {
+	composeEvidenceVideo(options: { runRoot: string; manifest: unknown; videoPath: string; outputPath: string; ffmpeg: string; ffprobe: string; workDir: string }): Promise<{
+		duration: number;
+		chapters: { at: number; title: string }[];
+		narration: { status: string; reason?: string };
+	}>;
+}
 
 interface Capture {
 	status?: string;
@@ -40,6 +56,7 @@ interface Manifest {
 	videoStartedAt?: string;
 	artifacts?: { videos?: string[] };
 	steps?: Step[];
+	rendering?: unknown;
 }
 
 interface Caption {
@@ -127,7 +144,7 @@ function accentFor(status: string | undefined): string {
 	}
 }
 
-export function renderChapters(runRoot: string): void {
+export async function renderChapters(runRoot: string): Promise<void> {
 	const manifestPath = path.join(runRoot, 'manifest.json');
 	const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as Manifest;
 	const videoStartedAtMs = Date.parse(manifest.videoStartedAt ?? '');
@@ -149,11 +166,6 @@ export function renderChapters(runRoot: string): void {
 		console.log('The run has no video start time, so captions cannot be aligned.');
 		return;
 	}
-	const font = fontCandidates.find(candidate => candidate && fs.existsSync(candidate));
-	if (!font) {
-		console.log('No usable font was found, so no captions were rendered.');
-		return;
-	}
 	const ffmpeg = resolveVideoTool('ffmpeg');
 	const ffprobe = resolveVideoTool('ffprobe');
 	if (!ffmpeg || !ffprobe) {
@@ -163,6 +175,29 @@ export function renderChapters(runRoot: string): void {
 	const videoPath = path.join(runRoot, relativeVideo);
 	const outputRelative = 'videos/annotated.mp4';
 	const outputPath = path.join(runRoot, outputRelative);
+
+	let fallbackReason: string | undefined;
+	if ((process.env.EVIDENCE_VIDEO_STYLE ?? '').trim().toLowerCase() !== 'caption-band') {
+		const storyboardDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vscode-evidence-video-'));
+		try {
+			const { composeEvidenceVideo } = require('./evidenceVideo/compose') as StoryboardRenderer;
+			const result = await composeEvidenceVideo({ runRoot, manifest, videoPath, outputPath, ffmpeg, ffprobe, workDir: storyboardDir });
+			finishRendering(runRoot, manifestPath, manifest, relativeVideo, outputRelative, { style: 'storyboard', ...result });
+			console.log(`Rendered the evidence video into ${outputRelative}: ${result.chapters.length} chapters, ${result.duration.toFixed(1)}s, narration ${result.narration.status}${result.narration.reason ? ` (${result.narration.reason})` : ''}.`);
+			return;
+		} catch (error) {
+			fallbackReason = error instanceof Error ? error.message : String(error);
+			console.warn(`Unable to render the storyboard video: ${fallbackReason}. Falling back to the caption band.`);
+		} finally {
+			fs.rmSync(storyboardDir, { recursive: true, force: true });
+		}
+	}
+
+	const font = fontCandidates.find(candidate => candidate && fs.existsSync(candidate));
+	if (!font) {
+		console.log('No usable font was found, so no captions were rendered.');
+		return;
+	}
 	const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vscode-evidence-chapters-'));
 	// Filters run from workDir with relative file names so no path escaping
 	// (drive letters, colons, backslashes) can corrupt the filter description.
@@ -308,13 +343,20 @@ export function renderChapters(runRoot: string): void {
 			outputPath
 		], { cwd: workDir, stdio: ['ignore', 'inherit', 'inherit'] });
 
-		manifest.artifacts!.videos = [...new Set([outputRelative, ...(manifest.artifacts?.videos ?? [])])];
-		fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, undefined, 2)}\n`);
-		pointReportAtAnnotatedVideo(runRoot, relativeVideo, outputRelative);
+		finishRendering(runRoot, manifestPath, manifest, relativeVideo, outputRelative, { style: 'caption-band', ...(fallbackReason ? { fallbackReason } : {}) });
 		console.log(`Captioned ${boundaries.length} steps into ${outputRelative}`);
 	} finally {
 		fs.rmSync(workDir, { recursive: true, force: true });
 	}
+}
+
+function finishRendering(runRoot: string, manifestPath: string, manifest: Manifest, rawVideo: string, annotatedVideo: string, rendering: Record<string, unknown>): void {
+	manifest.artifacts!.videos = [...new Set([annotatedVideo, ...(manifest.artifacts?.videos ?? [])])];
+	// Records which style was produced and why, so a degraded video is never
+	// mistaken for the full one.
+	manifest.rendering = rendering;
+	fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, undefined, 2)}\n`);
+	pointReportAtAnnotatedVideo(runRoot, rawVideo, annotatedVideo);
 }
 
 /**
@@ -365,9 +407,9 @@ function wrap(value: string, limit: number, maxLines: number): string[] {
  * The raw recording is authoritative, so a missing or failing ffmpeg is reported
  * and otherwise ignored.
  */
-export function tryRenderChapters(runRoot: string): void {
+export async function tryRenderChapters(runRoot: string): Promise<void> {
 	try {
-		renderChapters(runRoot);
+		await renderChapters(runRoot);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		console.warn(`Unable to render evidence captions: ${message}. The raw recording is unaffected.`);
@@ -375,5 +417,5 @@ export function tryRenderChapters(runRoot: string): void {
 }
 
 if (require.main === module) {
-	tryRenderChapters(path.resolve(process.argv[2] ?? process.env.RUN_ROOT ?? '.'));
+	void tryRenderChapters(path.resolve(process.argv[2] ?? process.env.RUN_ROOT ?? '.'));
 }
